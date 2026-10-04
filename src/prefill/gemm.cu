@@ -153,6 +153,13 @@ void absorb_hipblas_sticky(const char* what) {
     std::exit(1);
 }
 #define STRATA_ABSORB_HIPBLAS_STICKY(what) absorb_hipblas_sticky(what)
+#elif defined(__HIPCC__)
+// On Linux, rocBLAS builds with no tuned kernel for a shape on some cards (BF16/FP16 on gfx1031) look the kernel up,
+// run the fallback, return success and leave hipErrorNoBinaryForGpu set. Clear only that error; leave any other one.
+void absorb_hipblas_sticky(const char*) {
+    if (hipPeekAtLastError() == hipErrorNoBinaryForGpu) (void) hipGetLastError();
+}
+#define STRATA_ABSORB_HIPBLAS_STICKY(what) absorb_hipblas_sticky(what)
 #else
 #define STRATA_ABSORB_HIPBLAS_STICKY(what) ((void) 0)
 #endif
