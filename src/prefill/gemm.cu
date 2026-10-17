@@ -549,13 +549,17 @@ bool prompt_f16() {
     if (const int8_t c = cached[dev].load(std::memory_order_relaxed)) return c == 2;
     // Opt-in (#835): only STRATA_HIP_PROMPT_F16=1 turns it on.  It changes the prompt path's numbers (an FP16 rounding of
     // each 16-bit GEMM's output), so no card gets it unasked.  On gfx103x it is ~2x faster, so we say so once.
+    // A value starting with "gfx" is an arch prefix (STRATA_HIP_PROMPT_F16=gfx103): only the devices whose arch starts
+    // with it, so a gfx103x + gfx11xx pair keeps the gfx11xx card's hipBLASLt-tuned FP32-out GEMMs (f16_inplace is
+    // plain rocBLAS and would skip that table).
     const char* e = std::getenv("STRATA_HIP_PROMPT_F16");
-    const bool on = e != nullptr && e[0] == '1';
     hipDeviceProp_t p{};
     if (hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); p.gcnArchName[0] = 0; }
-    if (on) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=1: the prompt's 16-bit GEMMs run FP16 in and out "
+    const bool arch_sel = e != nullptr && std::strncmp(e, "gfx", 3) == 0;
+    const bool on = e != nullptr && (e[0] == '1' || (arch_sel && std::strncmp(p.gcnArchName, e, std::strlen(e)) == 0));
+    if (on) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=%s: the prompt's 16-bit GEMMs run FP16 in and out "
                                  "(rocBLAS is tuned only for that on gfx103x; not bit-identical to the default)%s",
-                         dev, p.gcnArchName[0] ? " " : "", p.gcnArchName, "\n");
+                         dev, p.gcnArchName[0] ? " " : "", p.gcnArchName, e, "\n");
     else if (e == nullptr && std::strncmp(p.gcnArchName, "gfx103", 6) == 0)
         std::fprintf(stderr, "strata prefill: HIP device %d %s - tip: STRATA_HIP_PROMPT_F16=1 reads long prompts about 2x faster here "
                              "(FP16 prompt GEMMs, rocBLAS is tuned only for FP16 on gfx103x; the numbers differ slightly, see docs/AMD_HIP.md)%s",
