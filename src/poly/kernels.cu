@@ -2123,21 +2123,42 @@ __device__ __forceinline__ h16 ld16(const _Float16* p) {   // 16 halves from a 1
 }
 }  // namespace wmma_attn
 
-// WAVES waves of 16 query rows each, keys KT (a multiple of 16) at a time.
-template <int DIM, int WAVES, int KT>
+// The queries as halves in log2 units, by key head group: qh[g][t * per + h][DIM] for head g * per + h of token t.
+__global__ void attn_q_half_kernel(const float* __restrict__ q, _Float16* __restrict__ qh, int rows, int n_head,
+                                   int per, int dim, float scale_log2) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x, quads = size_t(dim) / 4;
+    if (i >= size_t(rows) * n_head * quads) return;
+    const size_t c = 4 * (i % quads), th = i / quads;   // th = t * n_head + head
+    const int t = int(th / n_head), head = int(th % n_head), g = head / per;
+    const float4 x = *reinterpret_cast<const float4*>(q + th * dim + c);
+    _Float16* y = qh + ((size_t(g) * rows + t) * per + head % per) * dim + c;
+    y[0] = (_Float16) (x.x * scale_log2), y[1] = (_Float16) (x.y * scale_log2);
+    y[2] = (_Float16) (x.z * scale_log2), y[3] = (_Float16) (x.w * scale_log2);
+}
+
+// WAVES waves of 16 query rows each, keys KT (a multiple of 16) at a time.  QG: the A fragments of the queries come
+// from qh (attn_q_half_kernel) through the cache instead of shared memory; KG: the B fragments of the keys straight
+// from the fp16 cache.  Both leave shared memory to the transposed values and the weights, so more blocks fit a CU.
+template <int DIM, int WAVES, int KT, bool QG, bool KG>
 __global__ void __launch_bounds__(32 * WAVES)
-attn_wmma_kernel(const float* __restrict__ q, const half* __restrict__ kcache, const half* __restrict__ vcache,
-                 float* __restrict__ out, int rows, int n_head, int kv_heads, int per, long long pos,
-                 float scale_log2) {
+attn_wmma_kernel(const float* __restrict__ q, const _Float16* __restrict__ qh, const half* __restrict__ kcache,
+                 const half* __restrict__ vcache, float* __restrict__ out, int rows, int n_head, int kv_heads,
+                 int per, long long pos, float scale_log2) {
 #if defined(__GFX11__)
     using namespace wmma_attn;
     constexpr int ROWS = 16 * WAVES, NT = KT / 16;
     // rows of 16-byte multiples whose starts fall on different banks for the 16 rows a fragment reads
-    __shared__ __align__(16) _Float16 qs[ROWS][DIM + PAD], ks[KT][DIM + PAD], vt[DIM][KT + PAD],
+    __shared__ __align__(16) _Float16 qs[QG ? 1 : ROWS][DIM + PAD], ks[KG ? 1 : KT][DIM + PAD], vt[DIM][KT + PAD],
         ps[WAVES][16][KT + PAD];
     const int g = blockIdx.y, tokens = ROWS / per, t0 = blockIdx.x * tokens;
     const int lane = threadIdx.x % 32, w = threadIdx.x / 32, col = lane % 16, half_wave = lane / 16;
-    for (int i = threadIdx.x; i < ROWS * DIM / 4; i += blockDim.x) {   // the block's queries, in log2 units
+    // the lane's query row of the group, for A fragments read from qh (a row past the call's tokens reads row 0)
+    const _Float16* qrow = nullptr;
+    if constexpr (QG) {
+        const int r = w * 16 + col, tok = t0 + r / per;
+        qrow = qh + (size_t(g) * rows * per + (tok < rows ? size_t(tok) * per + r % per : 0)) * DIM;
+    }
+    for (int i = threadIdx.x; !QG && i < ROWS * DIM / 4; i += blockDim.x) {   // the block's queries, in log2 units
         const int r = i / (DIM / 4), c = 4 * (i % (DIM / 4)), tok = t0 + r / per;
         float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
         if (tok < rows) x = *reinterpret_cast<const float4*>(q + (size_t(tok) * n_head + g * per + r % per) * DIM + c);
@@ -2146,6 +2167,7 @@ attn_wmma_kernel(const float* __restrict__ q, const half* __restrict__ kcache, c
         qs[r][c + 2] = (_Float16) (x.z * scale_log2);
         qs[r][c + 3] = (_Float16) (x.w * scale_log2);
     }
+    (void) q, (void) scale_log2;
     long long own[8];   // the token of each of the lane's 8 rows attends keys [0, own]
     for (int i = 0; i < 8; ++i) own[i] = pos + t0 + (w * 16 + 2 * i + half_wave) / per;
     const long long n_keys = pos + min(t0 + tokens, rows);   // the block's last token attends keys [0, n_keys)
@@ -2160,20 +2182,26 @@ attn_wmma_kernel(const float* __restrict__ q, const half* __restrict__ kcache, c
             uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
             if (k0 + r < n_keys) {
                 const size_t at = (size_t(k0 + r) * kv_heads + g) * DIM + c;
-                kk = *reinterpret_cast<const uint4*>(kcache + at);
+                if constexpr (!KG) kk = *reinterpret_cast<const uint4*>(kcache + at);
                 vv = *reinterpret_cast<const uint4*>(vcache + at);
             }
-            *reinterpret_cast<uint4*>(&ks[r][c]) = kk;
+            if constexpr (!KG) *reinterpret_cast<uint4*>(&ks[r][c]) = kk;
             const _Float16* vh = reinterpret_cast<const _Float16*>(&vv);
             for (int j = 0; j < 8; ++j) vt[c + j][r] = vh[j];   // the values transposed: B fragments read a row
         }
         __syncthreads();
         f8 s[NT];   // the wave's 16 rows against the block's keys, 16 at a time
         for (int j = 0; j < NT; ++j) s[j] = f8{};
-        for (int d = 0; d < DIM; d += 16) {
-            const h16 a = ld16(&qs[w * 16 + col][d]);
+        const _Float16* krow[NT];   // KG: the lane's key of each 16, its last one past the block's keys
+        if constexpr (KG)
             for (int j = 0; j < NT; ++j)
-                s[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, ld16(&ks[16 * j + col][d]), s[j]);
+                krow[j] = reinterpret_cast<const _Float16*>(kcache) +
+                          (size_t(min(k0 + 16 * j + col, n_keys - 1)) * kv_heads + g) * DIM;
+        for (int d = 0; d < DIM; d += 16) {
+            const h16 a = QG ? ld16(qrow + d) : ld16(&qs[w * 16 + col][d]);
+            for (int j = 0; j < NT; ++j)
+                s[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, KG ? ld16(krow[j] + d) : ld16(&ks[16 * j + col][d]),
+                                                                  s[j]);
         }
         for (int i = 0; i < 8; ++i) {
             float v[NT], mx = -INFINITY;
@@ -2215,27 +2243,45 @@ attn_wmma_kernel(const float* __restrict__ q, const half* __restrict__ kcache, c
 }
 
 // one shape of attn_wmma_kernel; STRATA_POLY_WMMA_CFG=WxK (tuning only) picks another of the instantiated ones
-template <int DIM, int WAVES, int KT>
-void launch_wmma(const float* q, const uint16_t* kc, const uint16_t* vc, float* out, int rows, int n_head,
-                 int kv_heads, int per, long long pos, float scale_log2, cudaStream_t stream) {
+template <int DIM, int WAVES, int KT, bool QG = false, bool KG = false>
+void launch_wmma(const float* q, _Float16* qh, const uint16_t* kc, const uint16_t* vc, float* out, int rows,
+                 int n_head, int kv_heads, int per, long long pos, float scale_log2, cudaStream_t stream) {
+    if constexpr (QG) {
+        const size_t quads = size_t(rows) * n_head * DIM / 4;
+        attn_q_half_kernel<<<(unsigned) ((quads + 255) / 256), 256, 0, stream>>>(q, qh, rows, n_head, per, DIM,
+                                                                                  scale_log2);
+    }
     const dim3 gr((unsigned) ((rows + 16 * WAVES / per - 1) / (16 * WAVES / per)), (unsigned) kv_heads);
-    attn_wmma_kernel<DIM, WAVES, KT><<<gr, 32 * WAVES, 0, stream>>>(q, (const half*) kc, (const half*) vc, out,
-                                                                        rows, n_head, kv_heads, per, pos, scale_log2);
+    attn_wmma_kernel<DIM, WAVES, KT, QG, KG><<<gr, 32 * WAVES, 0, stream>>>(
+        q, qh, (const half*) kc, (const half*) vc, out, rows, n_head, kv_heads, per, pos, scale_log2);
 }
 
 template <int DIM>
-void attend_wmma(const float* q, const uint16_t* kc, const uint16_t* vc, float* out, int rows, int n_head,
-                 int kv_heads, int per, long long pos, float scale_log2, cudaStream_t stream) {
-    static const int cfg = [] {
+void attend_wmma(const float* q, _Float16* qh, const uint16_t* kc, const uint16_t* vc, float* out, int rows,
+                 int n_head, int kv_heads, int per, long long pos, float scale_log2, cudaStream_t stream) {
+    static const int cfg = [] {   // tuning only: WxK, then q (queries from qh) and k (keys from the cache)
         const char* e = std::getenv("STRATA_POLY_WMMA_CFG");
-        return e ? std::atoi(e) * 1000 + std::atoi(std::strchr(e, 'x') ? std::strchr(e, 'x') + 1 : "0") : 0;
+        if (!e) return 0;
+        const char* x = std::strchr(e, 'x');
+        return std::atoi(e) * 1000 + (x ? std::atoi(x + 1) : 0) + (std::strchr(e, 'q') ? 100000 : 0) +
+               (std::strchr(e, 'k') ? 200000 : 0);
     }();
+#define STRATA_W(W, K, QG, KG) launch_wmma<DIM, W, K, QG, KG>(q, qh, kc, vc, out, rows, n_head, kv_heads, per, pos, \
+                                                              scale_log2, stream)
     switch (cfg) {
-    case 2032: launch_wmma<DIM, 2, 32>(q, kc, vc, out, rows, n_head, kv_heads, per, pos, scale_log2, stream); break;
-    case 1032: launch_wmma<DIM, 1, 32>(q, kc, vc, out, rows, n_head, kv_heads, per, pos, scale_log2, stream); break;
-    case 2016: launch_wmma<DIM, 2, 16>(q, kc, vc, out, rows, n_head, kv_heads, per, pos, scale_log2, stream); break;
-    default: launch_wmma<DIM, 4, 16>(q, kc, vc, out, rows, n_head, kv_heads, per, pos, scale_log2, stream); break;
+    case 2032: STRATA_W(2, 32, false, false); break;
+    case 104016: STRATA_W(4, 16, true, false); break;
+    case 204016: STRATA_W(4, 16, false, true); break;
+    case 304016: STRATA_W(4, 16, true, true); break;
+    case 304032: STRATA_W(4, 32, true, true); break;
+    case 308016: STRATA_W(8, 16, true, true); break;
+    case 302032: STRATA_W(2, 32, true, true); break;
+    case 308032: STRATA_W(8, 32, true, true); break;
+    case 304064: STRATA_W(4, 64, true, true); break;
+    case 4016: STRATA_W(4, 16, false, false); break;   // the first version
+    default: STRATA_W(8, 32, true, true); break;   // RX 7800 XT: 7.85 ms against 12.65 (4x16) for 1024 tokens at 7000
     }
+#undef STRATA_W
 }
 #endif
 
@@ -3812,11 +3858,11 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
     if ((dim == 256 || dim == 128) && per >= 1 && 16 % per == 0 && window == 0 && ring == 0 && !whole && !sinks &&
         kq8.codes == nullptr && vq8.codes == nullptr && rdna3_wmma()) {
         if (dim == 256)
-            attend_wmma<256>(q, kcache, vcache, out, rows, n_head, kv_heads, per, (long long) pos,
-                             scale * 1.44269504f, cs(stream));
+            attend_wmma<256>(q, (_Float16*) work, kcache, vcache, out, rows, n_head, kv_heads, per,
+                             (long long) pos, scale * 1.44269504f, cs(stream));
         else
-            attend_wmma<128>(q, kcache, vcache, out, rows, n_head, kv_heads, per, (long long) pos,
-                             scale * 1.44269504f, cs(stream));
+            attend_wmma<128>(q, (_Float16*) work, kcache, vcache, out, rows, n_head, kv_heads, per,
+                             (long long) pos, scale * 1.44269504f, cs(stream));
         return;
     }
 #endif
