@@ -2112,7 +2112,7 @@ attn_flash128_kernel(const float* __restrict__ q, const half* __restrict__ kcach
 namespace wmma_attn {
 typedef _Float16 h16 __attribute__((ext_vector_type(16)));
 typedef float f8 __attribute__((ext_vector_type(8)));
-constexpr int WAVES = 4, ROWS = 16 * WAVES, KT = 16, PAD = 8;
+constexpr int PAD = 8;
 
 __device__ __forceinline__ h16 ld16(const _Float16* p) {   // 16 halves from a 16-byte aligned place
     const uint4 a = *reinterpret_cast<const uint4*>(p), b = *reinterpret_cast<const uint4*>(p + 8);
@@ -2123,13 +2123,15 @@ __device__ __forceinline__ h16 ld16(const _Float16* p) {   // 16 halves from a 1
 }
 }  // namespace wmma_attn
 
-template <int DIM>
-__global__ void __launch_bounds__(32 * wmma_attn::WAVES)
+// WAVES waves of 16 query rows each, keys KT (a multiple of 16) at a time.
+template <int DIM, int WAVES, int KT>
+__global__ void __launch_bounds__(32 * WAVES)
 attn_wmma_kernel(const float* __restrict__ q, const half* __restrict__ kcache, const half* __restrict__ vcache,
                  float* __restrict__ out, int rows, int n_head, int kv_heads, int per, long long pos,
                  float scale_log2) {
 #if defined(__GFX11__)
     using namespace wmma_attn;
+    constexpr int ROWS = 16 * WAVES, NT = KT / 16;
     // rows of 16-byte multiples whose starts fall on different banks for the 16 rows a fragment reads
     __shared__ __align__(16) _Float16 qs[ROWS][DIM + PAD], ks[KT][DIM + PAD], vt[DIM][KT + PAD],
         ps[WAVES][16][KT + PAD];
@@ -2166,25 +2168,37 @@ attn_wmma_kernel(const float* __restrict__ q, const half* __restrict__ kcache, c
             for (int j = 0; j < 8; ++j) vt[c + j][r] = vh[j];   // the values transposed: B fragments read a row
         }
         __syncthreads();
-        f8 s = f8{};   // the wave's 16 rows against the block's KT keys
-        for (int d = 0; d < DIM; d += 16)
-            s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ld16(&qs[w * 16 + col][d]), ld16(&ks[col][d]), s);
-        const long long key = k0 + col;
+        f8 s[NT];   // the wave's 16 rows against the block's keys, 16 at a time
+        for (int j = 0; j < NT; ++j) s[j] = f8{};
+        for (int d = 0; d < DIM; d += 16) {
+            const h16 a = ld16(&qs[w * 16 + col][d]);
+            for (int j = 0; j < NT; ++j)
+                s[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, ld16(&ks[16 * j + col][d]), s[j]);
+        }
         for (int i = 0; i < 8; ++i) {
-            const float v = key > own[i] ? -INFINITY : s[i];
-            float mx = v;
+            float v[NT], mx = -INFINITY;
+            for (int j = 0; j < NT; ++j) {
+                v[j] = k0 + 16 * j + col > own[i] ? -INFINITY : s[j][i];
+                mx = fmaxf(mx, v[j]);
+            }
             for (int x = 1; x < 16; x *= 2) mx = fmaxf(mx, __shfl_xor(mx, x));   // across the row's 16 lanes
             const float now = fmaxf(m[i], mx), base = now == -INFINITY ? 0.f : now;
-            const float f = exp2f(m[i] - base), p = exp2f(v - base);
+            const float f = exp2f(m[i] - base);
             m[i] = now;
-            l[i] = l[i] * f + p;
+            l[i] *= f;
             for (int n = 0; n < DIM / 16; ++n) o[n][i] *= f;
-            ps[w][2 * i + half_wave][col] = (_Float16) p;   // the weights, to be read back as an A fragment
+            for (int j = 0; j < NT; ++j) {
+                const float p = exp2f(v[j] - base);
+                l[i] += p;
+                ps[w][2 * i + half_wave][16 * j + col] = (_Float16) p;   // read back as A fragments
+            }
         }
         __syncthreads();
-        const h16 pa = ld16(&ps[w][col][0]);
-        for (int n = 0; n < DIM / 16; ++n)
-            o[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, ld16(&vt[16 * n + col][0]), o[n]);
+        for (int j = 0; j < NT; ++j) {
+            const h16 pa = ld16(&ps[w][col][16 * j]);
+            for (int n = 0; n < DIM / 16; ++n)
+                o[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, ld16(&vt[16 * n + col][16 * j]), o[n]);
+        }
     }
     for (int i = 0; i < 8; ++i) {
         float sum = l[i];
@@ -2198,6 +2212,30 @@ attn_wmma_kernel(const float* __restrict__ q, const half* __restrict__ kcache, c
     (void) q, (void) kcache, (void) vcache, (void) out, (void) rows, (void) n_head, (void) kv_heads, (void) per,
         (void) pos, (void) scale_log2;   // only RDNA3 launches it (rdna3_wmma())
 #endif
+}
+
+// one shape of attn_wmma_kernel; STRATA_POLY_WMMA_CFG=WxK (tuning only) picks another of the instantiated ones
+template <int DIM, int WAVES, int KT>
+void launch_wmma(const float* q, const uint16_t* kc, const uint16_t* vc, float* out, int rows, int n_head,
+                 int kv_heads, int per, long long pos, float scale_log2, cudaStream_t stream) {
+    const dim3 gr((unsigned) ((rows + 16 * WAVES / per - 1) / (16 * WAVES / per)), (unsigned) kv_heads);
+    attn_wmma_kernel<DIM, WAVES, KT><<<gr, 32 * WAVES, 0, stream>>>(q, (const half*) kc, (const half*) vc, out,
+                                                                        rows, n_head, kv_heads, per, pos, scale_log2);
+}
+
+template <int DIM>
+void attend_wmma(const float* q, const uint16_t* kc, const uint16_t* vc, float* out, int rows, int n_head,
+                 int kv_heads, int per, long long pos, float scale_log2, cudaStream_t stream) {
+    static const int cfg = [] {
+        const char* e = std::getenv("STRATA_POLY_WMMA_CFG");
+        return e ? std::atoi(e) * 1000 + std::atoi(std::strchr(e, 'x') ? std::strchr(e, 'x') + 1 : "0") : 0;
+    }();
+    switch (cfg) {
+    case 2032: launch_wmma<DIM, 2, 32>(q, kc, vc, out, rows, n_head, kv_heads, per, pos, scale_log2, stream); break;
+    case 1032: launch_wmma<DIM, 1, 32>(q, kc, vc, out, rows, n_head, kv_heads, per, pos, scale_log2, stream); break;
+    case 2016: launch_wmma<DIM, 2, 16>(q, kc, vc, out, rows, n_head, kv_heads, per, pos, scale_log2, stream); break;
+    default: launch_wmma<DIM, 4, 16>(q, kc, vc, out, rows, n_head, kv_heads, per, pos, scale_log2, stream); break;
+    }
 }
 #endif
 
@@ -3773,16 +3811,12 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
     // with sinks (Flint's full layers): the kernel's softmax has no logit without a value
     if ((dim == 256 || dim == 128) && per >= 1 && 16 % per == 0 && window == 0 && ring == 0 && !whole && !sinks &&
         kq8.codes == nullptr && vq8.codes == nullptr && rdna3_wmma()) {
-        const int tokens = wmma_attn::ROWS / per;
-        const dim3 gr(grid(rows, tokens), kv_heads), bl(32 * wmma_attn::WAVES);
         if (dim == 256)
-            attn_wmma_kernel<256><<<gr, bl, 0, cs(stream)>>>(q, (const half*) kcache, (const half*) vcache, out, rows,
-                                                             n_head, kv_heads, per, (long long) pos,
-                                                             scale * 1.44269504f);
+            attend_wmma<256>(q, kcache, vcache, out, rows, n_head, kv_heads, per, (long long) pos,
+                             scale * 1.44269504f, cs(stream));
         else
-            attn_wmma_kernel<128><<<gr, bl, 0, cs(stream)>>>(q, (const half*) kcache, (const half*) vcache, out, rows,
-                                                             n_head, kv_heads, per, (long long) pos,
-                                                             scale * 1.44269504f);
+            attend_wmma<128>(q, kcache, vcache, out, rows, n_head, kv_heads, per, (long long) pos,
+                             scale * 1.44269504f, cs(stream));
         return;
     }
 #endif
