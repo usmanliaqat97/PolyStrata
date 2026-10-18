@@ -15,10 +15,13 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -2097,6 +2100,107 @@ attn_flash128_kernel(const float* __restrict__ q, const half* __restrict__ kcach
 #endif
 }
 
+#if defined(__HIPCC__)
+// attend_batch() on RDNA3's matrix cores (v_wmma_f32_16x16x16_f16, wave32) for heads of DIM values in groups of PER
+// (Qwen3.6: 256 and 8), the way attn_flash64_kernel goes: a launch block takes ROWS query rows of one key head group
+// (ROWS / PER tokens, a token's heads side by side), a wave 16 of them, and walks the keys KT at a time, keeping each
+// row's softmax in registers, so no score leaves the card's registers and shared memory.  The queries and the
+// weights are rounded to halves and the products sum floats, as with the cuBLAS products this replaces (rocBLAS has
+// only generic kernels for fp16-in / fp32-out on RDNA3: 33% of a 20K prompt's GPU time went there).
+//   WMMA fragments (wave32, checked against the CPU): A: lane l holds row l % 16, k 0..15; B: lane l holds column
+//   l % 16, k 0..15 (both replicated in the two half-waves); D: lane l's element i is row 2 i + l / 16, column l % 16.
+namespace wmma_attn {
+typedef _Float16 h16 __attribute__((ext_vector_type(16)));
+typedef float f8 __attribute__((ext_vector_type(8)));
+constexpr int WAVES = 4, ROWS = 16 * WAVES, KT = 16, PAD = 8;
+
+__device__ __forceinline__ h16 ld16(const _Float16* p) {   // 16 halves from a 16-byte aligned place
+    const uint4 a = *reinterpret_cast<const uint4*>(p), b = *reinterpret_cast<const uint4*>(p + 8);
+    h16 r;
+    __builtin_memcpy(&r, &a, 16);
+    __builtin_memcpy(reinterpret_cast<char*>(&r) + 16, &b, 16);
+    return r;
+}
+}  // namespace wmma_attn
+
+template <int DIM>
+__global__ void __launch_bounds__(32 * wmma_attn::WAVES)
+attn_wmma_kernel(const float* __restrict__ q, const half* __restrict__ kcache, const half* __restrict__ vcache,
+                 float* __restrict__ out, int rows, int n_head, int kv_heads, int per, long long pos,
+                 float scale_log2) {
+#if defined(__GFX11__)
+    using namespace wmma_attn;
+    // rows of 16-byte multiples whose starts fall on different banks for the 16 rows a fragment reads
+    __shared__ __align__(16) _Float16 qs[ROWS][DIM + PAD], ks[KT][DIM + PAD], vt[DIM][KT + PAD],
+        ps[WAVES][16][KT + PAD];
+    const int g = blockIdx.y, tokens = ROWS / per, t0 = blockIdx.x * tokens;
+    const int lane = threadIdx.x % 32, w = threadIdx.x / 32, col = lane % 16, half_wave = lane / 16;
+    for (int i = threadIdx.x; i < ROWS * DIM / 4; i += blockDim.x) {   // the block's queries, in log2 units
+        const int r = i / (DIM / 4), c = 4 * (i % (DIM / 4)), tok = t0 + r / per;
+        float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (tok < rows) x = *reinterpret_cast<const float4*>(q + (size_t(tok) * n_head + g * per + r % per) * DIM + c);
+        qs[r][c] = (_Float16) (x.x * scale_log2);
+        qs[r][c + 1] = (_Float16) (x.y * scale_log2);
+        qs[r][c + 2] = (_Float16) (x.z * scale_log2);
+        qs[r][c + 3] = (_Float16) (x.w * scale_log2);
+    }
+    long long own[8];   // the token of each of the lane's 8 rows attends keys [0, own]
+    for (int i = 0; i < 8; ++i) own[i] = pos + t0 + (w * 16 + 2 * i + half_wave) / per;
+    const long long n_keys = pos + min(t0 + tokens, rows);   // the block's last token attends keys [0, n_keys)
+    f8 o[DIM / 16];
+    for (int n = 0; n < DIM / 16; ++n) o[n] = f8{};
+    float m[8], l[8];   // per row: the largest score so far, and this lane's part of the sum of the weights
+    for (int i = 0; i < 8; ++i) m[i] = -INFINITY, l[i] = 0.f;
+    for (long long k0 = 0; k0 < n_keys; k0 += KT) {
+        __syncthreads();   // the last block of keys is done with
+        for (int i = threadIdx.x; i < KT * DIM / 8; i += blockDim.x) {
+            const int r = i / (DIM / 8), c = 8 * (i % (DIM / 8));
+            uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
+            if (k0 + r < n_keys) {
+                const size_t at = (size_t(k0 + r) * kv_heads + g) * DIM + c;
+                kk = *reinterpret_cast<const uint4*>(kcache + at);
+                vv = *reinterpret_cast<const uint4*>(vcache + at);
+            }
+            *reinterpret_cast<uint4*>(&ks[r][c]) = kk;
+            const _Float16* vh = reinterpret_cast<const _Float16*>(&vv);
+            for (int j = 0; j < 8; ++j) vt[c + j][r] = vh[j];   // the values transposed: B fragments read a row
+        }
+        __syncthreads();
+        f8 s = f8{};   // the wave's 16 rows against the block's KT keys
+        for (int d = 0; d < DIM; d += 16)
+            s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ld16(&qs[w * 16 + col][d]), ld16(&ks[col][d]), s);
+        const long long key = k0 + col;
+        for (int i = 0; i < 8; ++i) {
+            const float v = key > own[i] ? -INFINITY : s[i];
+            float mx = v;
+            for (int x = 1; x < 16; x *= 2) mx = fmaxf(mx, __shfl_xor(mx, x));   // across the row's 16 lanes
+            const float now = fmaxf(m[i], mx), base = now == -INFINITY ? 0.f : now;
+            const float f = exp2f(m[i] - base), p = exp2f(v - base);
+            m[i] = now;
+            l[i] = l[i] * f + p;
+            for (int n = 0; n < DIM / 16; ++n) o[n][i] *= f;
+            ps[w][2 * i + half_wave][col] = (_Float16) p;   // the weights, to be read back as an A fragment
+        }
+        __syncthreads();
+        const h16 pa = ld16(&ps[w][col][0]);
+        for (int n = 0; n < DIM / 16; ++n)
+            o[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, ld16(&vt[16 * n + col][0]), o[n]);
+    }
+    for (int i = 0; i < 8; ++i) {
+        float sum = l[i];
+        for (int x = 1; x < 16; x *= 2) sum += __shfl_xor(sum, x);
+        const int r = w * 16 + 2 * i + half_wave, tok = t0 + r / per;
+        if (tok >= rows) continue;
+        float* y = out + (size_t(tok) * n_head + g * per + r % per) * DIM + col;
+        for (int n = 0; n < DIM / 16; ++n) y[16 * n] = o[n][i] / sum;
+    }
+#else
+    (void) q, (void) kcache, (void) vcache, (void) out, (void) rows, (void) n_head, (void) kv_heads, (void) per,
+        (void) pos, (void) scale_log2;   // only RDNA3 launches it (rdna3_wmma())
+#endif
+}
+#endif
+
 __global__ void softcap_kernel(float* x, size_t n, float cap) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) x[i] = tanhf(x[i] * (1.0f / cap)) * cap;
@@ -2420,6 +2524,26 @@ __global__ void gdn_out_kernel(float* __restrict__ out, const float* __restrict_
 
 inline cudaStream_t cs(void* stream) { return (cudaStream_t) stream; }
 inline int grid(size_t n, int block) { return int((n + block - 1) / block); }
+
+// Whether attend_batch() takes attn_wmma_kernel on the current device: an RDNA3 card (gfx11), unless
+// STRATA_POLY_WMMA_ATTN=0.
+bool rdna3_wmma() {
+#if defined(__HIPCC__)
+    static const bool off = [] { const char* e = std::getenv("STRATA_POLY_WMMA_ATTN"); return e && e[0] == '0'; }();
+    if (off) return false;
+    constexpr int kMaxDev = 64;
+    static std::atomic<int8_t> known[kMaxDev] = {};   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDev) return false;
+    if (const int8_t k = known[dev].load(std::memory_order_relaxed)) return k == 2;
+    hipDeviceProp_t p{};
+    const bool yes = hipGetDeviceProperties(&p, dev) == hipSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0;
+    known[dev].store(yes ? 2 : 1, std::memory_order_relaxed);
+    return yes;
+#else
+    return false;
+#endif
+}
 
 // The PTX version the kernels run from here, 0 under HIP: a card running an older card's PTX has only that card's
 // instructions.
@@ -3642,6 +3766,26 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
             scale * 1.44269504f, window, ring, sinks);
         return;
     }
+
+#if defined(__HIPCC__)
+    // RDNA3: the matrix cores' flash attention for Qwen3.6's heads (and other heads of 128 / 256 in groups that divide
+    // 16) on an fp16 cache, instead of the two rocBLAS products a block of keys and the softmax between them.  Not
+    // with sinks (Flint's full layers): the kernel's softmax has no logit without a value
+    if ((dim == 256 || dim == 128) && per >= 1 && 16 % per == 0 && window == 0 && ring == 0 && !whole && !sinks &&
+        kq8.codes == nullptr && vq8.codes == nullptr && rdna3_wmma()) {
+        const int tokens = wmma_attn::ROWS / per;
+        const dim3 gr(grid(rows, tokens), kv_heads), bl(32 * wmma_attn::WAVES);
+        if (dim == 256)
+            attn_wmma_kernel<256><<<gr, bl, 0, cs(stream)>>>(q, (const half*) kcache, (const half*) vcache, out, rows,
+                                                             n_head, kv_heads, per, (long long) pos,
+                                                             scale * 1.44269504f);
+        else
+            attn_wmma_kernel<128><<<gr, bl, 0, cs(stream)>>>(q, (const half*) kcache, (const half*) vcache, out, rows,
+                                                             n_head, kv_heads, per, (long long) pos,
+                                                             scale * 1.44269504f);
+        return;
+    }
+#endif
     const cublasHandle_t h = (cublasHandle_t) blas;
     const float one = 1.0f, zero = 0.0f;
     const long long last = whole ? pos + rows - 1 : -1;
