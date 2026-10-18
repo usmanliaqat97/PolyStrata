@@ -2182,18 +2182,42 @@ attn_wmma_kernel(const float* __restrict__ q, const _Float16* __restrict__ qh, c
     for (int i = 0; i < 8; ++i) m[i] = -INFINITY, l[i] = 0.f;
     for (int k0 = 0; k0 < n_keys; k0 += KT) {
         __syncthreads();   // the last block of keys is done with
-        for (int i = threadIdx.x; i < KT * DIM / 8; i += blockDim.x) {
-            const int r = i / (DIM / 8), c = 8 * (i % (DIM / 8));
-            uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
-            if (k0 + r < n_keys) {
+        if constexpr (KG) {
+            // the values only, KP keys a thread: their values of a column go in as one write of 2 KP bytes
+            constexpr int KP = 4;   // 2 and 8: slower (5.28 / 5.58 ms against 4.84 for 1024 tokens at 7000)
+            static_assert(KT % KP == 0, "a block of keys in fours");
+            for (int i = threadIdx.x; i < KT / KP * DIM / 8; i += blockDim.x) {
+                const int r = KP * (i / (DIM / 8)), c = 8 * (i % (DIM / 8));
+                uint4 v[KP];
                 const size_t at = (size_t(k0 + r) * kv_heads + g) * DIM + c;
-                if constexpr (!KG) kk = *reinterpret_cast<const uint4*>(kcache + at);
-                vv = *reinterpret_cast<const uint4*>(vcache + at);
+                #pragma unroll
+                for (int t = 0; t < KP; ++t)
+                    v[t] = k0 + r + t < n_keys ? *reinterpret_cast<const uint4*>(vcache + at + size_t(t) * kv_heads * DIM)
+                                               : make_uint4(0, 0, 0, 0);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    _Float16 four[KP];
+                    #pragma unroll
+                    for (int t = 0; t < KP; ++t) four[t] = reinterpret_cast<const _Float16*>(&v[t])[j];
+                    uint2 w;
+                    __builtin_memcpy(&w, four, 8);
+                    *reinterpret_cast<uint2*>(&vt[c + j][r]) = w;   // B fragments read a row
+                }
             }
-            if constexpr (!KG) *reinterpret_cast<uint4*>(&ks[r][c]) = kk;
-            const _Float16* vh = reinterpret_cast<const _Float16*>(&vv);
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) vt[c + j][r] = vh[j];   // the values transposed: B fragments read a row
+        } else {
+            for (int i = threadIdx.x; i < KT * DIM / 8; i += blockDim.x) {
+                const int r = i / (DIM / 8), c = 8 * (i % (DIM / 8));
+                uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
+                if (k0 + r < n_keys) {
+                    const size_t at = (size_t(k0 + r) * kv_heads + g) * DIM + c;
+                    kk = *reinterpret_cast<const uint4*>(kcache + at);
+                    vv = *reinterpret_cast<const uint4*>(vcache + at);
+                }
+                *reinterpret_cast<uint4*>(&ks[r][c]) = kk;
+                const _Float16* vh = reinterpret_cast<const _Float16*>(&vv);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) vt[c + j][r] = vh[j];   // the values transposed: B fragments read a row
+            }
         }
         __syncthreads();
         f8 s[NT];   // the wave's 16 rows against the block's keys, 16 at a time
@@ -2300,6 +2324,7 @@ void attend_wmma(const float* q, _Float16* qh, const uint16_t* kc, const uint16_
     case 308016: STRATA_W(8, 16, true, true); break;
     case 302032: STRATA_W(2, 32, true, true); break;
     case 308032: STRATA_W(8, 32, true, true); break;
+    case 108032: STRATA_W(8, 32, true, false); break;
     case 308048: STRATA_W(8, 48, true, true); break;
     case 308064: STRATA_W(8, 64, true, true); break;
     case 304064: STRATA_W(4, 64, true, true); break;
