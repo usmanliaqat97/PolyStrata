@@ -2227,8 +2227,11 @@ attn_wmma_kernel(const float* __restrict__ q, const _Float16* __restrict__ qh, c
             const float f = exp2f(m[i] - base);
             m[i] = now;
             l[i] *= f;
-            #pragma unroll
-            for (int n = 0; n < DIM / 16; ++n) o[n][i] *= f;
+            // the values so far shrink to the new top; most blocks of keys leave every row's top as it was (f = 1
+            // exactly), and then the wave skips the 16 multiplies of the row, which would change nothing
+            if (__any(f != 1.0f))
+                #pragma unroll
+                for (int n = 0; n < DIM / 16; ++n) o[n][i] *= f;
             #pragma unroll
             for (int j = 0; j < NT; ++j) {
                 const float p = exp2f(v[j] - base);
@@ -2297,6 +2300,8 @@ void attend_wmma(const float* q, _Float16* qh, const uint16_t* kc, const uint16_
     case 308016: STRATA_W(8, 16, true, true); break;
     case 302032: STRATA_W(2, 32, true, true); break;
     case 308032: STRATA_W(8, 32, true, true); break;
+    case 308048: STRATA_W(8, 48, true, true); break;
+    case 308064: STRATA_W(8, 64, true, true); break;
     case 304064: STRATA_W(4, 64, true, true); break;
     case 4016: STRATA_W(4, 16, false, false); break;   // the first version
     default: STRATA_W(8, 32, true, true); break;   // RX 7800 XT: 7.85 ms against 12.65 (4x16) for 1024 tokens at 7000
