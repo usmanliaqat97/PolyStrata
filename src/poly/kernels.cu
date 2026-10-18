@@ -2168,14 +2168,19 @@ attn_wmma_kernel(const float* __restrict__ q, const _Float16* __restrict__ qh, c
         qs[r][c + 3] = (_Float16) (x.w * scale_log2);
     }
     (void) q, (void) scale_log2;
-    long long own[8];   // the token of each of the lane's 8 rows attends keys [0, own]
-    for (int i = 0; i < 8; ++i) own[i] = pos + t0 + (w * 16 + 2 * i + half_wave) / per;
-    const long long n_keys = pos + min(t0 + tokens, rows);   // the block's last token attends keys [0, n_keys)
+    // the token of each of the lane's 8 rows attends keys [0, own]: positions fit an int (the context is at most
+    // a few hundred thousand tokens), which keeps these out of the 64-bit registers this kernel is short of
+    int own[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) own[i] = int(pos) + t0 + (w * 16 + 2 * i + half_wave) / per;
+    const int n_keys = int(pos) + min(t0 + tokens, rows);   // the block's last token attends keys [0, n_keys)
     f8 o[DIM / 16];
+    #pragma unroll
     for (int n = 0; n < DIM / 16; ++n) o[n] = f8{};
     float m[8], l[8];   // per row: the largest score so far, and this lane's part of the sum of the weights
+    #pragma unroll
     for (int i = 0; i < 8; ++i) m[i] = -INFINITY, l[i] = 0.f;
-    for (long long k0 = 0; k0 < n_keys; k0 += KT) {
+    for (int k0 = 0; k0 < n_keys; k0 += KT) {
         __syncthreads();   // the last block of keys is done with
         for (int i = threadIdx.x; i < KT * DIM / 8; i += blockDim.x) {
             const int r = i / (DIM / 8), c = 8 * (i % (DIM / 8));
@@ -2187,34 +2192,44 @@ attn_wmma_kernel(const float* __restrict__ q, const _Float16* __restrict__ qh, c
             }
             if constexpr (!KG) *reinterpret_cast<uint4*>(&ks[r][c]) = kk;
             const _Float16* vh = reinterpret_cast<const _Float16*>(&vv);
+            #pragma unroll
             for (int j = 0; j < 8; ++j) vt[c + j][r] = vh[j];   // the values transposed: B fragments read a row
         }
         __syncthreads();
         f8 s[NT];   // the wave's 16 rows against the block's keys, 16 at a time
+        #pragma unroll
         for (int j = 0; j < NT; ++j) s[j] = f8{};
         const _Float16* krow[NT];   // KG: the lane's key of each 16, its last one past the block's keys
         if constexpr (KG)
+            #pragma unroll
             for (int j = 0; j < NT; ++j)
                 krow[j] = reinterpret_cast<const _Float16*>(kcache) +
                           (size_t(min(k0 + 16 * j + col, n_keys - 1)) * kv_heads + g) * DIM;
+        #pragma unroll 2   // not further: from the cache the compiler would start every load at once and spill
         for (int d = 0; d < DIM; d += 16) {
             const h16 a = QG ? ld16(qrow + d) : ld16(&qs[w * 16 + col][d]);
+            #pragma unroll
             for (int j = 0; j < NT; ++j)
                 s[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, KG ? ld16(krow[j] + d) : ld16(&ks[16 * j + col][d]),
                                                                   s[j]);
         }
+        #pragma unroll
         for (int i = 0; i < 8; ++i) {
             float v[NT], mx = -INFINITY;
+            #pragma unroll
             for (int j = 0; j < NT; ++j) {
                 v[j] = k0 + 16 * j + col > own[i] ? -INFINITY : s[j][i];
                 mx = fmaxf(mx, v[j]);
             }
+            #pragma unroll
             for (int x = 1; x < 16; x *= 2) mx = fmaxf(mx, __shfl_xor(mx, x));   // across the row's 16 lanes
             const float now = fmaxf(m[i], mx), base = now == -INFINITY ? 0.f : now;
             const float f = exp2f(m[i] - base);
             m[i] = now;
             l[i] *= f;
+            #pragma unroll
             for (int n = 0; n < DIM / 16; ++n) o[n][i] *= f;
+            #pragma unroll
             for (int j = 0; j < NT; ++j) {
                 const float p = exp2f(v[j] - base);
                 l[i] += p;
@@ -2222,18 +2237,23 @@ attn_wmma_kernel(const float* __restrict__ q, const _Float16* __restrict__ qh, c
             }
         }
         __syncthreads();
+        #pragma unroll
         for (int j = 0; j < NT; ++j) {
             const h16 pa = ld16(&ps[w][col][16 * j]);
+            #pragma unroll
             for (int n = 0; n < DIM / 16; ++n)
                 o[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, ld16(&vt[16 * n + col][16 * j]), o[n]);
         }
     }
+    #pragma unroll
     for (int i = 0; i < 8; ++i) {
         float sum = l[i];
+        #pragma unroll
         for (int x = 1; x < 16; x *= 2) sum += __shfl_xor(sum, x);
         const int r = w * 16 + 2 * i + half_wave, tok = t0 + r / per;
         if (tok >= rows) continue;
         float* y = out + (size_t(tok) * n_head + g * per + r % per) * DIM + col;
+        #pragma unroll
         for (int n = 0; n < DIM / 16; ++n) y[16 * n] = o[n][i] / sum;
     }
 #else
