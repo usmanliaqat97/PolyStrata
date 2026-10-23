@@ -3110,6 +3110,26 @@ bool FileExpertSource::pin_cache_complement(
         return false;
     }
 #endif
+    // The GGUF in place on Linux: the copy reads the shards unbuffered (O_DIRECT, read_direct's batches), and the
+    // mapped tier is back once it is built.  Through the mapping the shards' pages stayed in the file cache beside the
+    // copy (only experts.bin gives them back layer by layer), and with the copy holding most of the RAM every new page
+    // first cost a reclaim: IQ3_S's 46 GiB on a 64 GB PC slowed from ~0.55 to ~0.2 GiB/s after its first 8 GiB.
+    // STRATA_COMPLEMENT_UNBUFFERED=0 copies through the mapping as before.
+    bool copy_ub = false;
+    const int64_t copy_ub_fallbacks = direct_fallbacks_.load(std::memory_order_relaxed);
+#if defined(__linux__)
+    if (bytes > 0 && !role_ptr_.empty() && direct_.empty() && !unmapped_) {
+        const char* v = std::getenv("STRATA_COMPLEMENT_UNBUFFERED");
+        std::string why;
+        if (v != nullptr && v[0] != '\0' && std::atoi(v) == 0)
+            std::fprintf(stderr, "FileExpertSource: the cache complement is copied through the mapping "
+                                 "(STRATA_COMPLEMENT_UNBUFFERED=0)\n");
+        else if (open_direct(why))
+            copy_ub = true;
+        else
+            std::fprintf(stderr, "FileExpertSource: the cache complement is copied through the mapping%s\n", why.c_str());
+    }
+#endif
     std::atomic<int64_t> next_layer{0}, layers_done{0};
     std::atomic<uint64_t> copied{0};
     std::atomic<bool> failed{false};
@@ -3203,9 +3223,18 @@ bool FileExpertSource::pin_cache_complement(
     {
         const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
         std::vector<std::thread> pool;
-        for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
-        worker();
+        // unbuffered: every worker on a thread of its own, so read_direct's buffer and AIO context go with it
+        for (int i = copy_ub ? 0 : 1; i < threads; ++i) pool.emplace_back(worker);
+        if (!copy_ub) worker();
         for (auto& t : pool) t.join();
+    }
+    if (copy_ub) {   // the mapped tier as before
+        for (void* d : direct_) close_direct(d);
+        direct_.clear();
+        const int64_t fb = direct_fallbacks_.load(std::memory_order_relaxed) - copy_ub_fallbacks;
+        std::fprintf(stderr, "FileExpertSource: the cache complement was read unbuffered (O_DIRECT)");
+        if (fb > 0) std::fprintf(stderr, ", %lld blob(s) through the mapping after a failed read", (long long) fb);
+        std::fprintf(stderr, "\n");
     }
     std::fflush(stderr);
     if (failed.load()) {
