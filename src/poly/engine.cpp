@@ -619,6 +619,15 @@ void Engine::vmm_unmap(Mapped& m, size_t bytes) {
         must(cuMemSetAccess(m.base + at, n, &access, 1), "mapping VRAM again");
         at += n;
     }
+    // With every page of VRAM visible to the CPU (Resizable BAR) amdgpu updates the page tables from the CPU, and
+    // the TLB flush after an unmap has no fence to wait for and is skipped (ROCm/TheRock#8744): the card keeps the
+    // released pieces' translations, and a piece mapped at those addresses later (cover(), grow_cache()) is
+    // reached through the pages it replaced.  The attention rows a read writes there land elsewhere and the answer
+    // turns to garbage (an RX 7800 XT, Flint).  KFD flushes the card's TLBs when it unmaps a buffer, so one is
+    // allocated and freed here, as rocm-systems#13106 does.
+    void* flush = nullptr;
+    if (cudaMalloc(&flush, size_t(4) << 20) == cudaSuccess) cudaFree(flush);
+    else (void) cudaGetLastError();
     // amdgpu counts the VRAM as free 2 to 5 ms later: a reading before that (mind_vram()'s log line, cover()) is
     // short by what was given back.  At most 100 ms, as another program may take VRAM meanwhile.
     const size_t back = (had - m.mapped) / 8 * 7, want = free_b + back;
