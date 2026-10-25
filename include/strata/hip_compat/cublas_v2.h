@@ -9,6 +9,7 @@
 #include <rocblas/rocblas.h>
 #define CUBLAS_COMPUTE_32F rocblas_datatype_f32_r
 #define CUBLAS_DEFAULT_MATH 0
+#define CUBLAS_TENSOR_OP_MATH 1
 #define CUBLAS_GEMM_DEFAULT rocblas_gemm_algo_standard
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP rocblas_gemm_algo_standard
 #define CUBLAS_OP_N rocblas_operation_none
@@ -57,6 +58,7 @@ inline rocblas_status cublasGemmStridedBatchedEx(rocblas_handle h, rocblas_opera
 #else
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
 #define CUBLAS_DEFAULT_MATH HIPBLAS_DEFAULT_MATH
+#define CUBLAS_TENSOR_OP_MATH HIPBLAS_TENSOR_OP_MATH
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
 #define CUBLAS_OP_N HIPBLAS_OP_N
