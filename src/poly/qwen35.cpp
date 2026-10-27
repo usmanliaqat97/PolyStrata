@@ -189,8 +189,12 @@ void Qwen35::assign_scratch() {
     sg_ = fbuf(n);
     if (rows_ >= kStageRows) awork_ = fbuf(heads + heads / 2 + 1 + 3 * n * n_head_);   // a prompt batch's attention
     if (rows_ >= kStageRows && opt_.kv_format == KvFmt::kQ8_0) {
-        // the K and V blocks a q8 prompt batch dequantizes, side by side; work_halves_ halves each
-        work_halves_ = kQ8WorkRows * (size_t) n_kv_ * head_dim_;
+        // the K and V blocks a q8 prompt batch dequantizes, side by side; work_halves_ halves each.  Where
+        // attend_batch() takes RDNA3's matrix-core kernel, every row a prompt batch can attend (the whole context:
+        // 2 x 64 MiB for Qwen3.6 at 65,536), which that kernel then reads as an fp16 cache instead of the products
+        const size_t rows = attend_batch_wmma(head_dim_, n_head_, n_kv_)
+                                ? std::max(kQ8WorkRows, (size_t) opt_.max_context) : kQ8WorkRows;
+        work_halves_ = rows * (size_t) n_kv_ * head_dim_;
         q8w_ = fbuf((2 * work_halves_ + 1) / 2);
     }
     if (gdn_mma_.initialize([&] {

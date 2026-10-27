@@ -275,12 +275,19 @@ size_t attend_split_floats(int chunk, int n_head, int max_rows, int dim);
 /// read that exactly as they read an fp16 cache, so the results match attend()'s q8 read.  Each workspace holds
 /// work_halves halves, `work_halves / (kv_heads * dim)` rows at most: a block of keys larger than that is split,
 /// taking more products.  The fp16 path (both null) is unchanged and reads the caches where they lie.
+/// Where attend_batch_wmma() (RDNA3) and the workspaces hold every row the tokens attend (pos + rows, with no
+/// window, ring, `whole` or sinks), those rows are dequantized at once and RDNA3's matrix-core kernel reads them as
+/// an fp16 cache instead of the products.
 /// `sinks` as attend()'s: the sink joins each token's sum after the last block of rows.
 void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint16_t* vcache, int64_t pos, int rows,
                   float* score, size_t score_floats, float* work, float* out, int dim, int n_head, int kv_heads,
                   float scale, void* stream, int window = 0, int ring = 0, bool whole = false, Kvq8 kq8 = {},
                   Kvq8 vq8 = {}, uint16_t* kwork = nullptr, uint16_t* vwork = nullptr, size_t work_halves = 0,
                   const float* sinks = nullptr);
+/// Whether attend_batch() takes RDNA3's matrix-core kernel for heads of `dim` values, n_head of them over kv_heads,
+/// on the current device (with no window, ring, `whole` or sinks): an RDNA3 card unless STRATA_POLY_WMMA_ATTN=0.
+/// An engine with a q8 cache sizes its workspaces by it.
+bool attend_batch_wmma(int dim, int n_head, int kv_heads);
 /// attend() over int8 caches (store_int8): the same attention, the same order of products and sums.  `q8` is scratch
 /// in the same form for this call's queries (rows * n_head * dim / kQ8_0Values blocks of codes, and as many
 /// deltas).  A score is a dp4a of a lane's own run of codes - the query's against the key's, both 4-aligned - and

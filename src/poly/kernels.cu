@@ -3232,6 +3232,21 @@ __global__ void dequant_q8_kernel(const int8_t* __restrict__ codes, const uint16
     out[(size_t) blockIdx.y * width + i] = __float2half((float) codes[at + i] * d);
 }
 
+// rows 0 to keys - 1 of a q8 cache into an fp16 copy laid out as the cache, in launches of at most 32768 rows (a
+// grid has 65535)
+static void dequant_q8_rows(Kvq8 c, half* out, int width, size_t keys, cudaStream_t s) {
+    for (size_t r0 = 0; r0 < keys; r0 += 32768) {
+        const unsigned m = unsigned(std::min<size_t>(32768, keys - r0));
+        dequant_q8_kernel<<<dim3(grid(width, 256), m), 256, 0, s>>>(c.codes, c.scales, out + r0 * width, width,
+                                                                     (long long) r0);
+    }
+}
+
+bool attend_batch_wmma(int dim, int n_head, int kv_heads) {
+    const int per = kv_heads > 0 ? n_head / kv_heads : 0;
+    return (dim == 256 || dim == 128) && per >= 1 && 16 % per == 0 && rdna3_wmma();
+}
+
 size_t attend_split_floats(int chunk, int n_head, int max_rows, int dim) {
     return size_t(chunk) * n_head * grid(size_t(max_rows), SPLIT_KEYS) * (dim + 2);
 }
@@ -3904,16 +3919,25 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
 #if defined(__HIPCC__)
     // RDNA3: the matrix cores' flash attention for Qwen3.6's heads (and other heads of 128 / 256 in groups that divide
     // 16) on an fp16 cache, instead of the two rocBLAS products a block of keys and the softmax between them.  Not
-    // with sinks (Flint's full layers): the kernel's softmax has no logit without a value
-    if ((dim == 256 || dim == 128) && per >= 1 && 16 % per == 0 && window == 0 && ring == 0 && !whole && !sinks &&
-        kq8.codes == nullptr && vq8.codes == nullptr && rdna3_wmma()) {
-        if (dim == 256)
-            attend_wmma<256>(q, (_Float16*) work, kcache, vcache, out, rows, n_head, kv_heads, per,
-                             (long long) pos, scale * 1.44269504f, cs(stream));
-        else
-            attend_wmma<128>(q, (_Float16*) work, kcache, vcache, out, rows, n_head, kv_heads, per,
-                             (long long) pos, scale * 1.44269504f, cs(stream));
-        return;
+    // with sinks (Flint's full layers): the kernel's softmax has no logit without a value.  A q8 cache takes it too
+    // where its workspace holds every row these tokens attend (0 to pos + rows - 1): they are dequantized into it
+    // first, as the products below dequantize a block, and the kernel reads the workspace as an fp16 cache.
+    if (window == 0 && ring == 0 && !whole && !sinks && attend_batch_wmma(dim, n_head, kv_heads)) {
+        const bool kq = kq8.codes != nullptr, vq = vq8.codes != nullptr;
+        const size_t keys = size_t(pos) + size_t(rows);
+        if ((!kq || kwork) && (!vq || vwork) && (!(kq || vq) || keys <= work_halves / size_t(width))) {
+            if (kq) dequant_q8_rows(kq8, (half*) kwork, width, keys, cs(stream));
+            if (vq) dequant_q8_rows(vq8, (half*) vwork, width, keys, cs(stream));
+            const uint16_t* kc = kq ? kwork : kcache;
+            const uint16_t* vc = vq ? vwork : vcache;
+            if (dim == 256)
+                attend_wmma<256>(q, (_Float16*) work, kc, vc, out, rows, n_head, kv_heads, per, (long long) pos,
+                                 scale * 1.44269504f, cs(stream));
+            else
+                attend_wmma<128>(q, (_Float16*) work, kc, vc, out, rows, n_head, kv_heads, per, (long long) pos,
+                                 scale * 1.44269504f, cs(stream));
+            return;
+        }
     }
 #endif
     const cublasHandle_t h = (cublasHandle_t) blas;
