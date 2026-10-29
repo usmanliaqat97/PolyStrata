@@ -2444,6 +2444,8 @@ class Vision:
                 return base64.b64decode(source.split(",", 1)[1])
             except (IndexError, ValueError) as e:                # no comma, or not base64
                 raise ValueError(f"the image's data: URL could not be read ({e})") from None
+        # local debloat: Open WebUI and OhMyPi send pictures inline; a link or a file path is never read
+        raise ValueError("send the image inline as a data: URL (this server reads no image links or files)")
         if source.startswith(("http://", "https://")):
             return Vision.download(source)
         path = source[7:] if source.startswith("file://") else source
@@ -2464,6 +2466,7 @@ class Vision:
     def download(url: str) -> bytes:
         """An image URL's bytes, at most IMAGE_URL_MAX of them: the whole response was read, so a huge or endless one
         filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection."""
+        raise ValueError("send the image inline as a data: URL (this server fetches no image links)")   # local debloat
         too_big = f"the image URL's file is over {IMAGE_URL_MAX >> 20} MiB"
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
@@ -5776,6 +5779,11 @@ def make_handler(svc: Service):
             proxies that pass their own name on keep working."""
             if not super().parse_request():
                 return False
+            route = (self.command, self.path.split("?")[0].rstrip("/"))
+            if route not in LOCAL_ROUTES:                        # local debloat: see LOCAL_ROUTES
+                print(f"[strata] refused {route[0]} {route[1]}: not one of LOCAL_ROUTES", flush=True)
+                self._json(404, {"error": {"type": "not_found", "message": "not found"}})
+                return False
             host = self.headers.get("Host")
             if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
                 return True
@@ -6812,6 +6820,13 @@ def make_handler(svc: Service):
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
 
     return Handler
+
+
+# Local (debloat, 2026-10-29): the only routes this PC's clients use. llm-proxy and its clients (OhMyPi, Open WebUI) send
+# /v1/chat/completions, our scripts check /health and /v1/models, ComfyUI's llm_vram_swap posts /unload. Every other
+# route answers 404 before it is read: the web app, the settings and config writers, model switching (/api/models/*,
+# /v1/load), the slot files, MCP, image generation, the metrics and VRAM routes and the Anthropic and Responses APIs.
+LOCAL_ROUTES = {("GET", "/health"), ("GET", "/v1/models"), ("POST", "/v1/chat/completions"), ("POST", "/unload")}
 
 
 class Server(ThreadingHTTPServer):
