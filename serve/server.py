@@ -822,6 +822,11 @@ class StrataEngine:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
+    @property
+    def disk_sessions(self) -> bool:
+        """SAVE / RESTORE: the Strata project's engine has them, strata-poly does not (issue 114)."""
+        return Path(str(self.spawn[0])).stem.lower() not in ("strata-poly", "strata-glm")
+
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
@@ -2347,6 +2352,15 @@ class Vision:
                 pass
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
+    @staticmethod
+    def elastic_of(cfg: dict) -> bool:
+        """Whether the encoder starts with the first picture and stops after elastic_idle_s without one.  On the GPU
+        it is opt-in (the vision section's "elastic": true, with the config's "vram_elastic"), and while it runs the
+        engine's expert cache keeps elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down).  On the
+        CPU it is the default ("elastic": false keeps it running): Qwen3.6's encoder holds 1.08 GiB of RAM and starts
+        in 1 to 2 s."""
+        return cfg.get("elastic") is True or ("elastic" not in cfg and not cfg.get("gpu"))
+
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
         absolute = lambda p: os.path.abspath(p) if os.path.dirname(str(p)) else p   # the encoder runs in its own dir (#480)  # noqa: E731
         args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
@@ -2364,10 +2378,8 @@ class Vision:
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
-        # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
-        # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
-        # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
-        self.elastic = cfg.get("elastic") is True
+        self.on_cpu = not cfg.get("gpu")
+        self.elastic = self.elastic_of(cfg)
         self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
         if not lazy and not self.elastic:
@@ -3668,6 +3680,10 @@ class Service:
                 waiting = False
                 if not self.loaded():
                     return error(503, "the model is not loaded")
+                # under the FIFO: a model switch replaces the engine there (issue 114: strata-poly got the command and
+                # its reply made the server end it)
+                if not getattr(self.engine, "disk_sessions", True):
+                    return error(501, "slot save/restore is not available with strata-poly, this model's engine")
                 with self.status_lock:
                     self.status.update(busy=True, phase="saving the session" if action == "save"
                                        else "restoring a session", started=time.time(), first_token=None,
@@ -3767,11 +3783,11 @@ class Service:
         """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
         cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
         warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident low-RAM mode)
-        the encoder starts anyway, as a non-elastic one would."""
+        the encoder starts anyway, as a non-elastic one would.  An encoder on the CPU takes no VRAM: it just starts."""
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
             return
-        if hasattr(self.engine, "vram") and self.loaded():
+        if not getattr(v, "on_cpu", False) and hasattr(self.engine, "vram") and self.loaded():
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
                 self.vision_held = True
@@ -3816,7 +3832,9 @@ class Service:
         if not getattr(v, "elastic", False):
             return
         print(f"[strata] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
-              f"without one; while it runs the expert cache keeps {v.elastic_mib} MiB free for it", flush=True)
+              "without one; " + ("it runs on the CPU, and its RAM is free in between ('\"elastic\": false' in the vision "
+                                 "section keeps it running)" if getattr(v, "on_cpu", False) else
+                                 f"while it runs the expert cache keeps {v.elastic_mib} MiB free for it"), flush=True)
 
         def loop():
             while True:
@@ -4724,12 +4742,19 @@ class Service:
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
-        if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
+        # Issue 16: a reply as long as the context has left (no max_tokens, or fit_max_tokens) was cut by the context,
+        # not by a small cap the client chose, so it gets the answer room however short it is.  Flint in an agent
+        # had 416 tokens left in a full 32K context, thought through all of them and gave no answer.
+        ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+        by_context = bool(max_new) and ctx > 0 and max_new >= ctx - CTX_SLACK - len(ids)
+        if (thinking and not budget and self.answer_room and max_new
+                and (max_new >= ANSWER_ROOM_MIN_CAP or by_context)):
             # 0.1.45: max_tokens counts the thinking too.  A client that caps the reply at 8192 (the desktop agent's
             # harness sends max_completion_tokens: 8192 on every request) and a task the model thinks long about got
             # the cut-off in the middle of the thinking and NO answer.  So thinking is closed early enough to leave
             # the answer its quarter of the cap (the budget's wrap-up: a short closing sentence, </think>, the answer).
-            # A request with a budget of its own, or max_tokens below ANSWER_ROOM_MIN_CAP, is left as it was.
+            # A request with a budget of its own, or one that asked for fewer than ANSWER_ROOM_MIN_CAP tokens, is left
+            # as it was.
             budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
             if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
                   "(\"answer_room\": false in the config turns this off)", flush=True)
@@ -5147,7 +5172,12 @@ class Service:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
-                            if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
+                            if finish == "length" and parser.state in ("reasoning", "rcall") and by_context:
+                                print(f"[strata] the reply reached the end of the context while still thinking, so it "
+                                      f"has no answer: only {max_new} tokens were left of the {ctx}. A larger "
+                                      "--max-context in strata-<model>.json, or \"drop_oldest\": true there, leaves "
+                                      "room for the conversation to go on", flush=True)
+                            elif finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
                                       "strata-<model>.json for every request) leaves room to answer", flush=True)
@@ -7416,18 +7446,17 @@ def start_model(cfg: dict, tok, lazy: bool = False):
         pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
         print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
     if cfg.get("vision"):
-        elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
-        print("the vision encoder starts with the first picture (elastic) ..." if elastic else
-              "loading the vision encoder ..." if not lazy else
-              "vision encoder unloaded; it starts with the model ...", flush=True)
         # relative paths are the config's cwd's, as for the engine below
         vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                 for k, v in cfg["vision"].items()}
-        if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
+        if vcfg.get("elastic") is True and vcfg.get("gpu") and cfg.get("vram_elastic") is not True:
             print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                   "encoder its VRAM): the encoder starts with the model instead", flush=True)
             vcfg["elastic"] = False
+        print("the vision encoder starts with the first picture (elastic) ..." if Vision.elastic_of(vcfg) else
+              "loading the vision encoder ..." if not lazy else
+              "vision encoder unloaded; it starts with the model ...", flush=True)
         vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                         env=vision_env(cfg, env), lazy=lazy)
     print("model unloaded; the first request loads it ..." if lazy else

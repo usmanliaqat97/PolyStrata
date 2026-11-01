@@ -241,7 +241,8 @@ struct Kvq8 {
 /// With `whole` the call's tokens see each other: each attends up to the call's last row, so a token can attend
 /// window - 1 + rows of them.
 /// With `at`, the tokens start at the position the card holds there; the launches are sized for `room` rows,
-/// which must be no fewer than a launch's tokens attend between them, and score has room for them.
+/// which must be no fewer than a launch's tokens attend between them, and score has room for them.  With `whole`
+/// too the call is one launch: rows is no more than chunk.
 /// score_floats: the floats score holds, when more than the above.  Heads of 64 values in groups of 4, or of 128 in
 /// groups of 8, over the whole conversation then take a launch block each block of rows, a launch as many tokens as
 /// score has room for those blocks' sums of at the longest the call can attend (attend_split_floats() for chunk of
@@ -338,6 +339,24 @@ void shortconv(const float* bcx, float* state, const float* w, float* out, int c
 void gdn_step(float* qkv, float* alpha, float* beta, const float* dt, const float* a, float* s,
               const float* z, const float* o_norm, float* out, int dim, int n_head, int k_heads, int rows,
               float norm_eps, void* stream, float* snap = nullptr, size_t stride = 0, unsigned snaps = 0);
+/// conv4_silu() for a block of `rows` tokens that see each other (Clover's block guesses): a token's sum adds
+/// input t + d of the block times right[d - 1] for d = 1 to 3, right (3, channels).  The state is only read.
+void conv4_block_silu(const float* x, const float* state, const float* w, const float* right, float* out,
+                      int channels, int rows, void* stream);
+/// gdn_step() for a block of up to 32 tokens that see each other (Clover's block guesses), which leaves the state
+/// as it was.  Token i's output before the norm is a softmax's weights on the block's values and on the state's
+/// read S q_i times the token's decay: by the dot product of the normed query and key times logit_scale[h] for
+/// token j, by hist_b[h] + hist_c[h] * log(rows / 32) for the state.  The share beta is not used.  w: scratch of
+/// n_head * rows * (rows + 1) floats.  Takes and leaves the rest as gdn_step() does.
+void gdn_block(float* qkv, float* alpha, float* beta, const float* dt, const float* a, const float* s,
+               const float* z, const float* o_norm, const float* logit_scale, const float* hist_b,
+               const float* hist_c, float* out, float* w, int dim, int n_head, int k_heads, int rows,
+               float norm_eps, void* stream);
+/// The router scores of `rows` tokens that guess a block together (Clover), kept to few experts: each token's n_used
+/// likeliest by softmax probability, those probabilities added up per expert over the rows, and the experts in order
+/// of that sum while the ones before them hold less than `share` of it.  The others' scores become -inf in every
+/// row.  Ties go to the lower expert.  n_expert is a multiple of 32, up to 1024.
+void coreset_mask(float* logits, int n_expert, int n_used, int rows, float share, void* stream);
 
 // ---- DeepSeek V4 (deepseek4): one key head that is its value too, a window of raw rows, rows compressed 4 or 128
 // to one, and an indexer that picks among the 4-to-1 rows

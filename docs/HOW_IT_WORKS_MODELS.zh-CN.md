@@ -95,6 +95,21 @@
 
 每个部分及其数据：[docs/BACKENDS.md](BACKENDS.md#how-a-backend-works)（英文）。
 
+## Clover-35B-A3B-Preview
+
+<p align="center"><img src="media/how-it-works-clover.svg" width="860" alt="模型的 10,240 个专家：回答反复用到的在显卡上，其余的在内存里，模型文件在 SSD 上"></p>
+
+- **在 Qwen3.6-35B-A3B 上接着训练出来的：** 10,240 个小专家组成的团队，40 层，每层 256 个，每个词只需要从每一层里用 8 个。
+- **你的显卡** 能放多少放多少：8 GB 的卡上约 2,200 到 4,100 个，规格越小放得越多，24 GB 起能放下 Q3_K_M 的全部专家。
+  在 8 GB 的卡上，回答用到的专家里有 60% 到 80% 由显卡提供。**你的内存** 存放其余的，**你的处理器** 同时把它们算出来。
+  **你的 SSD** 存放模型文件，文件原地使用，硬盘上不会多出一份副本。
+- **没有预猜模块。** Clover 训练时学会了一次写出一整块词：先放一排空位，一起填上，所以它也能这样猜接下来的词。
+  但每猜一块都要把整个模型再跑一遍，花的时间比猜对省下的还多，所以这个功能是关着的（[测量结果](BACKENDS.md#clover-35b-a3b-preview)，英文）。
+  引擎只根据对话里重复出现的文字来猜。
+- **长文本分大块读入**（每次 1,024 个 token），和 Qwen3.6-35B-A3B 一样。
+
+每个部分及其数据：[docs/BACKENDS.md](BACKENDS.md#clover-35b-a3b-preview)（英文）。
+
 ## Ornith 1.5
 
 <p align="center"><img src="media/how-it-works-ornith.svg" width="860" alt="模型的 10,240 个专家：回答反复用到的在显卡上，其余的在内存里，模型文件在 SSD 上"></p>

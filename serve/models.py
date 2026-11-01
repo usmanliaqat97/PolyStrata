@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 BACKENDS = {
     "glm5-next": "glm5-next", "glm5next": "glm5-next",
     "qwen35moe": "qwen35moe",
+    "clover_moe": "clover_moe",
     "gemma4": "gemma4",
     "deepseek4": "deepseek4",
     "lfm2moe": "lfm2moe",

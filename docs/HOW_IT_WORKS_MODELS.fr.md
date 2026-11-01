@@ -121,6 +121,25 @@ Chaque partie et ses chiffres : [docs/FLINT.md](FLINT.md) (en anglais).
 
 Chaque partie et ses chiffres : [docs/BACKENDS.md](BACKENDS.md#how-a-backend-works) (en anglais).
 
+## Clover-35B-A3B-Preview
+
+<p align="center"><img src="media/how-it-works-clover.svg" width="860" alt="Les 10,240 experts du modèle : ceux qu'une réponse choisit sans cesse sur la carte graphique, les autres en RAM, le fichier du modèle sur le SSD"></p>
+
+- **Qwen3.6-35B-A3B entraîné plus loin :** une équipe de 10,240 petits experts, 256 dans chacune de 40 couches, et
+  seulement 8 par couche pour chaque mot.
+- **Votre carte graphique** en garde autant qu'elle peut : environ 2,200 à 4,100 sur une carte de 8 Go, d'autant plus
+  que la taille est petite, et tous ceux de Q3_K_M à partir de 24 Go. Sur la carte de 8 Go, ceux qu'elle contient
+  servent 60 à 80 % de ce qu'une réponse utilise. **Votre RAM** contient les autres, et **votre processeur** les calcule
+  en même temps. **Votre SSD** contient le fichier du modèle, utilisé là où il se trouve, sans seconde copie.
+- **Pas de bloc de brouillon.** Clover a été entraîné à écrire un bloc de mots d'un coup en remplissant des blancs
+  ensemble, et il peut ainsi deviner les mots suivants. Mais chaque bloc deviné refait tourner tout le modèle, ce qui a
+  coûté plus que les bonnes devinettes n'ont fait gagner, donc c'est désactivé
+  ([mesures](BACKENDS.md#clover-35b-a3b-preview), en anglais). Le moteur ne devine qu'à partir du texte que la
+  discussion répète.
+- **Les longs textes sont lus par gros morceaux** (1,024 tokens à la fois), comme avec Qwen3.6-35B-A3B.
+
+Chaque partie et ses chiffres : [docs/BACKENDS.md](BACKENDS.md#clover-35b-a3b-preview) (en anglais).
+
 ## Ornith 1.5
 
 <p align="center"><img src="media/how-it-works-ornith.svg" width="860" alt="Les 10,240 experts du modèle : ceux qu'une réponse choisit sans cesse sur la carte graphique, les autres en RAM, le fichier du modèle sur le SSD"></p>

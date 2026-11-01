@@ -114,6 +114,24 @@ Every part and its numbers: [docs/FLINT.md](FLINT.md).
 
 Every part and its numbers: [docs/BACKENDS.md](BACKENDS.md#how-a-backend-works).
 
+## Clover-35B-A3B-Preview
+
+<p align="center"><img src="media/how-it-works-clover.svg" width="860" alt="The model's 10,240 experts: the ones an answer keeps using on the graphics card, the rest in RAM, the model's file on the SSD"></p>
+
+- **Qwen3.6-35B-A3B trained further:** a team of 10,240 small experts, 256 in each of 40 layers, and only 8 of every
+  layer for each word.
+- **Your graphics card** keeps as many as fit: about 2,200 to 4,100 of them on an 8 GB card, the more the smaller the
+  size, and all of Q3_K_M from 24 GB on. On the 8 GB card the ones it holds serve 60 to 80% of what an answer uses.
+  **Your RAM** holds the rest, and **your processor** runs them at the same time. **Your SSD** holds the model's file,
+  which is used where it is, with no second copy.
+- **No draft block.** Clover was trained to write a block of words at once, filling in blanks together, and it can
+  guess the next words that way. That runs the whole model once more for each block of guesses, which cost more than
+  the right guesses saved, so it is off ([measured](BACKENDS.md#clover-35b-a3b-preview)). The engine guesses only from
+  text the conversation repeats.
+- **Long texts are read in big pieces** (1,024 tokens at a time), as with Qwen3.6-35B-A3B.
+
+Every part and its numbers: [docs/BACKENDS.md](BACKENDS.md#clover-35b-a3b-preview).
+
 ## Ornith 1.5
 
 <p align="center"><img src="media/how-it-works-ornith.svg" width="860" alt="The model's 10,240 experts: the ones an answer keeps using on the graphics card, the rest in RAM, the model's file on the SSD"></p>

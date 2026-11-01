@@ -84,6 +84,10 @@ class KfdDetection(unittest.TestCase):
         # the RX 6600 / 6600 XT / 6650 XT (gfx1032) too: one owner built for it and ran Qwen3.6 on these wheels
         self.assertEqual(setup.ROCM_INDEXES["gfx1032"], setup.ROCM_INDEXES["gfx1030"])
         self.assertIsNone(setup.amd_problem({"arch": "gfx1032"}))
+        # PR 102: an RX 5700 XT (gfx1010, RDNA1) ran four models on Windows; its Linux wheels are their own family
+        self.assertTrue(setup.ROCM_INDEXES["gfx1010"].endswith("/gfx101X-dgpu/"))
+        self.assertIsNone(setup.amd_problem({"arch": "gfx1010"}))
+        self.assertIn("gfx1010", setup.AMD_CARDS)
 
 
 class GpuLists(unittest.TestCase):

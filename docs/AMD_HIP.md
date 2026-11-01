@@ -464,8 +464,9 @@ same `hip_compat` headers as the main engine, with the CUDA driver's virtual mem
 (`hip_compat/cuda.h`). There is no ready-made AMD engine: setup compiles one for the card. On Linux with ROCm from
 a system install or AMD's wheels in `.venv`, as for the main engine; on Windows with AMD's TheRock
 Windows wheels in `.rocm-win` (the private venv `tools\hip\build_windows.bat` uses) and Visual Studio 2022's C++
-build tools. The Windows path has run one model on one card (Tiel Coder 35B-A3B below); every other one there is
-unreported, so setup warns before it installs a model.
+build tools. The Windows path has run on two cards: Tiel Coder 35B-A3B on an RX 9070 XT (below), and Qwen3.6, Ornith
+1.5, Tiel Coder and Gemma 4 on an RX 5700 XT (gfx1010, PR 102); every other one there is unreported, so setup warns
+before it installs a model.
 
 - Install as for NVIDIA: `./setup.sh --family qwen36` (or `lfm25`, `flint`, `ornith`, `gemma4`, `tiel`, `glm`,
   `deepseek`, `kolibri`).
@@ -680,6 +681,12 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   71.1% of the experts from VRAM ([discussion 49](https://github.com/VecSzn/PolyStrata/discussions/49)). The card
   needs no `HSA_OVERRIDE_GFX_VERSION`. One left in the shell from an older guide (10.3.0 makes the card a gfx1030)
   stops this engine at the first request with `rms_norm: device kernel image is invalid`; unset it.
+- **gfx1010** (RX 5600 XT / 5700 / 5700 XT, RDNA1): setup knows it (unvalidated). One owner ran an RX 5700 XT 8 GB
+  under Windows 11, the engine compiled for gfx1010 from AMD's TheRock 10.2.0a20260930 Windows packages with no
+  patch: the official suite at 32K for Qwen3.6, Ornith, Tiel Coder and Gemma 4, 132 requests with no errors, short
+  chats written at 28.6 to 31.4 tok/s ([PR 102](https://github.com/VecSzn/PolyStrata/pull/102),
+  `bench/results/2026-10-27-community-rx5700xt-windows-qwen36-q3`). On Linux it takes the `gfx101X-dgpu` wheels and
+  has not been tried.
 - **gfx1150** (Radeon 890M, Ryzen AI 9 HX PRO 370, Strix Point, #1217): builds and runs from 0.1.40.2 as an unvalidated target (CMake warns; the
   device code already covers it: the WMMA guards and `gfx_arch_is_gfx11_wmma()` include it). One community machine: MINISFORUM N5 PRO, 96 GB DDR5-5600, GTT
   raised to 64 GiB (`ttm.pages_limit=16777216 ttm.page_pool_size=16777216`), TheRock ROCm 7.14.1 for gfx1150, an unprivileged LXC container, IQ3_XXS: chat and

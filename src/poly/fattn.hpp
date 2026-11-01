@@ -3,8 +3,8 @@
 // The keys go in blocks: under q8_0 each block's K and V are dequantized to fp16 in the scratch, the kernel attends
 // to them with the causal mask computed from the positions, and the blocks' results are merged by their softmax max
 // and sum.  An fp16 cache is read where it lies, but for the last block (the batch's own rows), which is copied.
-// Opt-in: STRATA_FATTN=1 (Qwen35::attn).  fdec_q8() and fdec_f16() are the decode side (a few tokens), a kernel of
-// this project's own: opt-in with STRATA_FDEC=1.
+// On wherever it fits unless STRATA_FATTN=0 (Qwen35::attn).  fdec_q8() and fdec_f16() are the decode side (a few
+// tokens), a kernel of this project's own: on from 4,096 positions unless STRATA_FDEC=0, from the first with =1.
 //
 // Every call enqueues on the given CUDA stream.  Pointers are device pointers.
 #pragma once
